@@ -1,21 +1,13 @@
 
 from cuda_K_means import kmeans
 import math
-import numpy as np
 import torch
 from torch.utils.data import Dataset,DataLoader
 import numpy as np
 from tqdm import tqdm
 from model import MAE_ViT
-import matplotlib.pyplot as plt
-from torch.nn.parameter import Parameter
-from torch.nn.functional import cross_entropy
 from Sinkhorn_cuda import compute_optimal_transport
 from kmeans import kmeans_np
-# from entropy.dse import diffusion_spectral_entropy
-# from entropy.dsmi import diffusion_spectral_mutual_information
-from fea_ext import get_fea_file
-from sk_cluster import sk_cluster
 from scipy.optimize import linear_sum_assignment
 import os
 from get_data_for_wvd.main import load_data
@@ -73,26 +65,27 @@ def loss_fun(x,output,fea_mid,alpha=0.1,beta=0.1,num_cluster=4,save_epoch=0,cent
     L1 = torch.mean((x-output)**2)
     d = torch.zeros([x.size()[0],num_cluster]).to('cuda')
     if center_old is not None:
-        gam = 0.01
+        gam = 0.1
         center_new = find_center_cuda(fea_mid[0], num_cluster)
         center = match(center_old, center_new, gam)
     for pl_i, i in enumerate(fea_mid[0]):
         for pl_j, j in enumerate(center):
             d[pl_i, pl_j] = torch.mean((i - j) ** 2)
-    # for i, _ in enumerate(d):
-    #     d[i, :] /= d[i, :].sum()
-    # pseudo_label = torch.argmin(d, dim=1)
     num, cls = d.shape[:]
+    # selecting the nearest-neighbor-labeling or SK labeling
     with torch.no_grad():
-        pseudo_label = torch.argmin(d, dim=1)
-        # t, v = compute_optimal_transport(d, (torch.ones([num, ]) / num).to('cuda'),
-        #                                  (torch.ones([cls, ]) / cls).to('cuda'), 20)
-        # for i, _ in enumerate(t):
-        #     t[i, :] /= t[i, :].sum()
-        # pseudo_label = torch.argmax(t, dim=1)
+        # NN Labeling
+        # pseudo_label = torch.argmin(d, dim=1)
+        # SK Labeling
+        t, v = compute_optimal_transport(d, (torch.ones([num, ]) / num).to('cuda'),
+                                         (torch.ones([cls, ]) / cls).to('cuda'), 20)
+        for i, _ in enumerate(t):
+            t[i, :] /= t[i, :].sum()
+        pseudo_label = torch.argmax(t, dim=1)
+
     P = torch.exp(-beta*d)
     P = P / P.sum(dim=1, keepdim=True)
-    # # P = P/P.sum()
+    # just cross entropy loss
     Cen_loss = cross_entropy_fuzzy(P, pseudo_label,P, 0,save_epoch)
 
     return L1 + alpha * Cen_loss, Cen_loss, center
@@ -107,14 +100,22 @@ def get_MAE_model_Mo(batch_size,warmup_epoch,epoch_sum,mask_ratio,patch_size,bas
     train_loader = DataLoader(train_data,batch_size=batch_size,num_workers=0,drop_last=True
                               ,shuffle=True)
     test_loader = DataLoader(test_data,batch_size=batch_size,num_workers=0)
-
+    # selecting the setting of MAEVIT
     model = MAE_ViT(image_size=128,
                     patch_size=patch_size,
                     emb_dim=192,
                     mask_ratio=mask_ratio
                     )
+    # model = MAE_ViT(image_size=128,
+    #                 patch_size=patch_size,
+    #                 emb_dim=192,
+    #                 mask_ratio=mask_ratio,
+    #                 encoder_layer=4,
+    #                 decoder_layer=4,
+    #                 encoder_head=6,
+    #                 decoder_head=6
+    #                 )
     model.load_state_dict(torch.load(str(num_cls)+'class_MAE_checkpoint/' + model_name))
-    # model.parameters()
     train(model,train_loader,test_loader,batch_size,patch_size,base_learning_rate,mask_ratio,warmup_epoch,epoch_sum,data_file,model_name,num_cls,alpha,beta,center_name)
 
 
@@ -132,7 +133,7 @@ def train(model,train_loader,test_loader,batch_size,patch_size,base_learning_rat
     fea_data = np.load(fea_name)
     center = torch.from_numpy(kmeans_np(fea_data,num_cls,need_center=True)).to('cuda')
     optimizer = torch.optim.AdamW([{"params": model.parameters()}], lr=base_learning_rate * batch_size / 256,betas=(0.9,0.99),
-                                  weight_decay=0.01)
+                                  weight_decay=1e-6)
     lr_func = lambda epoch: min((epoch + 1) / (warmup_epoch + 1e-8),
                                 0.5 * (math.cos(epoch / epoch_sum * math.pi) + 1))
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_func, verbose=True)
@@ -142,24 +143,18 @@ def train(model,train_loader,test_loader,batch_size,patch_size,base_learning_rat
         label_list = []
         with tqdm(total=len(train_loader), desc=f'Epoch{epoch}/{epoch_sum}', postfix=dict, mininterval=0.3) as pbar:
             for data, label in train_loader:
-                # data = torch.from_numpy(data)
-                # label = torch.from_numpy(label)
                 data = data.float()
                 data = data.to(device)
-                # label = label.long()
-                # label = label.to(device)
                 optimizer.zero_grad()
                 output, mask, fea_mid = model(data)
                 fea_list.append(fea_mid[0].detach().to('cpu').numpy())
                 label_list.append(label.detach().numpy())
-                #loss = torch.mean((data - output)**2) #** 2 * mask) / mask_ratio
                 loss,cen_loss,center_old = loss_fun(data, output, fea_mid,alpha,beta,num_cls,save_epoch=save_epoch,center=center,center_old=center_old)
                 loss.backward()
                 optimizer.step()
                 if cen_loss != 0:
                     loss_all.append(loss.cpu().detach().numpy())
                     train_loss = np.array(loss_all).mean()
-                # pbar.set_description("mean_loss: %.4f" % train_loss.item())
                 #为便于观测损失变化，将平均损失增大100倍
                 pbar.set_postfix(**{'train_loss': loss.cpu().detach().numpy(),"mean_loss:":100*train_loss.item()})
                 pbar.update(1)
@@ -193,12 +188,9 @@ def test(model,test_loader,mask_ratio,save_epoch,alpha,beta,num_cls,center):
     loss_all = []
     with tqdm(total=len(test_loader), postfix=dict, mininterval=0.3) as pbar:
         for data, label in test_loader:
-            # data = torch.from_numpy(data)
-            # label = torch.from_numpy(label)
             data = data.float()
             label = label.long()
             data = data.to(device)
-            label = label.to(device)
             output,mask,fea_mid = model(data)
             loss,cen_loss,_ = loss_fun(data, output, fea_mid,alpha,beta,num_cls,save_epoch=save_epoch,center=center)
             if cen_loss != 0:
